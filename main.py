@@ -1,15 +1,25 @@
 import sys
 import math
+import io
+import base64
 import tkinter as tk
 from tkinter import ttk
 
 # Try to import Pillow for rotated text rendering (recommended)
+# We separate core PIL from ImageTk so rotated text works even if ImageTk is missing.
 try:
-    from PIL import Image, ImageDraw, ImageFont, ImageTk  # type: ignore
-    PIL_AVAILABLE = True
+    from PIL import Image, ImageDraw, ImageFont  # type: ignore
+    PIL_CORE_AVAILABLE = True
 except Exception:  # pragma: no cover
-    PIL_AVAILABLE = False
-    Image = ImageDraw = ImageFont = ImageTk = None  # type: ignore
+    PIL_CORE_AVAILABLE = False
+    Image = ImageDraw = ImageFont = None  # type: ignore
+
+try:
+    from PIL import ImageTk as PIL_ImageTk  # type: ignore
+    PIL_IMAGETK_AVAILABLE = True
+except Exception:  # pragma: no cover
+    PIL_ImageTk = None  # type: ignore
+    PIL_IMAGETK_AVAILABLE = False
 
 
 # ---------- Display and rotation config ----------
@@ -90,8 +100,32 @@ class RotatedCanvas:
         return self.canvas.create_line(X1, Y1, X2, Y2, **kwargs)
 
     def image(self, x, y, pil_image, anchor="center"):
-        # Convert PIL image to PhotoImage and place it
-        photo = ImageTk.PhotoImage(pil_image)
+        # Convert PIL image to PhotoImage and place it (support both ImageTk and pure Tk paths)
+        photo = None
+        if PIL_IMAGETK_AVAILABLE:
+            try:
+                photo = PIL_ImageTk.PhotoImage(pil_image)
+            except Exception:
+                photo = None
+        if photo is None:
+            # Fallback: encode PIL image to PNG bytes and load via Tk PhotoImage
+            try:
+                bio = io.BytesIO()
+                pil_image.save(bio, format="PNG")
+                b64 = base64.b64encode(bio.getvalue()).decode("ascii")
+                photo = tk.PhotoImage(data=b64, format="PNG")
+            except Exception:
+                # As a last resort, try PPM without alpha by compositing onto a solid background
+                try:
+                    bg = Image.new("RGB", pil_image.size, (16, 17, 20))  # approx BG_COLOR
+                    tmp = pil_image.convert("RGBA")
+                    bg.paste(tmp, mask=tmp.split()[3] if tmp.mode == "RGBA" else None)
+                    bio = io.BytesIO()
+                    bg.save(bio, format="PPM")
+                    b64 = base64.b64encode(bio.getvalue()).decode("ascii")
+                    photo = tk.PhotoImage(data=b64)
+                except Exception:
+                    return None
         self._images.append(photo)
         X, Y = self.to_physical(x, y)
         return self.canvas.create_image(X, Y, image=photo, anchor=anchor)
@@ -104,7 +138,7 @@ def draw_text(rot: RotatedCanvas, x, y, text: str, font_size=18, color=BTN_TEXT,
     Draw text rotated 90° CCW so that it visually matches the overall 270°-rotated UI.
     Coordinates x, y are in logical space (portrait).
     """
-    if not PIL_AVAILABLE:
+    if not PIL_CORE_AVAILABLE:
         # Fallback: plain canvas text (won't be rotated). Still usable if Pillow is not installed.
         X, Y = RotatedCanvas.to_physical(x, y)
         return rot.canvas.create_text(X, Y, text=text, fill=color, anchor=anchor, font=(FONT_FALLBACK[0], font_size, "bold" if bold else "normal"))
@@ -114,7 +148,12 @@ def draw_text(rot: RotatedCanvas, x, y, text: str, font_size=18, color=BTN_TEXT,
     text_padding = 4
     dummy = Image.new("RGBA", (1, 1), (0, 0, 0, 0))
     d = ImageDraw.Draw(dummy)
-    w, h = d.textbbox((0, 0), text, font=font)[2:]
+    try:
+        bbox = d.textbbox((0, 0), text, font=font)
+        w, h = bbox[2] - bbox[0], bbox[3] - bbox[1]
+    except Exception:
+        # Older Pillow fallback
+        w, h = d.textsize(text, font=font)
     img = Image.new("RGBA", (w + text_padding * 2, h + text_padding * 2), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
     d.text((text_padding, text_padding), text, font=font, fill=color)
@@ -126,7 +165,7 @@ def draw_text(rot: RotatedCanvas, x, y, text: str, font_size=18, color=BTN_TEXT,
 
 
 def _load_font(size: int, bold=False):
-    if not PIL_AVAILABLE:
+    if not PIL_CORE_AVAILABLE:
         return None
     # Try common fonts typically available on Raspberry Pi OS
     candidates = [
@@ -233,11 +272,11 @@ class DPadCircle:
         self.callback = callback
 
     def draw(self):
-        # Outer circle (approximate with oval)
-        self.rot.rect(self.cx - self.r1, self.cy - self.r1, self.cx + self.r1, self.cy + self.r1,
+        # Outer circle
+        self.rot.oval(self.cx - self.r1, self.cy - self.r1, self.cx + self.r1, self.cy + self.r1,
                       outline=DIVIDER, width=3)
         # Inner circle
-        self.rot.rect(self.cx - self.r0, self.cy - self.r0, self.cx + self.r0, self.cy + self.r0,
+        self.rot.oval(self.cx - self.r0, self.cy - self.r0, self.cx + self.r0, self.cy + self.r0,
                       outline=ACCENT, width=3)
         # Direction hints (arrows)
         draw_text(self.rot, self.cx, self.cy - (self.r0 + self.r1) / 2, "▲", font_size=22, color=BTN_TEXT)
@@ -505,6 +544,13 @@ def setup_kiosk_window(root: tk.Tk):
     # Exit shortcuts for development
     root.bind("<Escape>", lambda e: root.destroy())
     root.bind("<Control-q>", lambda e: root.destroy())
+
+    # Report text rendering capability once
+    try:
+        print(f"[HomeHub] Pillow core: {PIL_CORE_AVAILABLE}, ImageTk: {PIL_IMAGETK_AVAILABLE}")
+        sys.stdout.flush()
+    except Exception:
+        pass
 
 
 def main():
